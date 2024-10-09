@@ -1,0 +1,777 @@
+import sys
+import sqlite3
+import requests
+import datetime
+import logging
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTabWidget,
+    QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QTextEdit, QMessageBox, QComboBox,
+    QDateTimeEdit, QSystemTrayIcon, QDialog, QTableWidget,
+    QTableWidgetItem, QHeaderView, QScrollArea
+)
+from PyQt5.QtGui import QIcon, QFont, QColor, QPalette
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, Qt
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# Configure logging
+logging.basicConfig(
+    filename='warframe_app.log',
+    level=logging.INFO,
+    format='%(asctime)s:%(levelname)s:%(message)s'
+)
+
+
+def log_activity(message):
+    logging.info(message)
+
+
+def log_error(message):
+    logging.error(message)
+
+
+# Database Initialization
+def initialize_database():
+    conn = sqlite3.connect('warframe_app.db')
+    cursor = conn.cursor()
+
+    # Create Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            platform TEXT NOT NULL
+        )
+    ''')
+
+    # Create Alerts table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mission_type TEXT NOT NULL,
+            reward TEXT NOT NULL,
+            expiry DATETIME NOT NULL,
+            status TEXT NOT NULL
+        )
+    ''')
+
+    # Create Reminders table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            reminder_type TEXT NOT NULL,
+            details TEXT NOT NULL,
+            scheduled_time DATETIME NOT NULL,
+            status TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES Users(id)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+
+# API Interaction
+def fetch_current_alerts():
+    """
+    Fetches current alerts from the WarframeStat.us API based on the user's platform.
+    Uses the URL format: https://api.warframestat.us/{platform}/alerts
+    """
+    base_url = f'https://api.warframestat.us/ps4/alerts'
+
+    try:
+        response = requests.get(base_url, timeout=10)
+        response.raise_for_status()
+        alerts = response.json()
+        current_time = datetime.datetime.utcnow()
+
+        # Filter active alerts
+        active_alerts = [alert for alert in alerts if datetime.datetime.fromisoformat(alert['expiry']) > current_time]
+
+        log_activity("Fetched current alerts.")
+        return active_alerts
+    except requests.exceptions.RequestException as e:
+        log_error(f"Error fetching alerts: {e}")
+        return []
+
+
+# Thread for Fetching Alerts
+class FetchAlertsThread(QThread):
+    fetched = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, platform):
+        super().__init__()
+        self.platform = platform  # Store the platform
+
+    def run(self):
+        try:
+            alerts = fetch_current_alerts(self.platform)
+            self.fetched.emit(alerts)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# Platform Selection Dialog
+class PlatformSelectionDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Select Your Platform")
+        self.setFixedSize(400, 200)
+        self.selected_platform = None  # To store the user's choice
+
+        layout = QVBoxLayout()
+
+        # Instruction Label
+        label = QLabel("Please select your gaming platform:")
+        label.setFont(QFont("Arial", 14))
+        layout.addWidget(label)
+
+        # Platform ComboBox
+        self.platform_combo = QComboBox()
+        self.platform_combo.addItems(["PC", "PS4", "Xbox", "Nintendo Switch"])
+        self.platform_combo.setFont(QFont("Arial", 12))
+        layout.addWidget(self.platform_combo)
+
+        # Submit Button
+        submit_button = QPushButton("Confirm")
+        submit_button.setFont(QFont("Arial", 12))
+        submit_button.clicked.connect(self.confirm_selection)
+        layout.addWidget(submit_button)
+
+        self.setLayout(layout)
+
+    def confirm_selection(self):
+        self.selected_platform = self.platform_combo.currentText()
+        if self.selected_platform:
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Selection Error", "Please select a platform before proceeding.")
+
+
+# Main Window
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Warframe Desktop App")
+        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowIcon(QIcon('icons/icon.png'))  # Replace with your icon path
+
+        # System Tray Icon
+        self.tray_icon = QSystemTrayIcon(QIcon('icons/icon.png'), self)
+        self.tray_icon.show()
+
+        # Scheduler for Reminders
+        self.scheduler = BackgroundScheduler()
+        self.scheduler.start()
+
+        # Initialize the database
+        initialize_database()
+
+        # Check if the user has already set their platform
+        user_platform = self.get_user_platform()
+
+        if not user_platform:
+            self.show_platform_selection_dialog()
+        else:
+            self.setup_ui(user_platform)
+
+    def get_user_platform(self):
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT platform FROM Users WHERE username = ?", ("default_user",))
+            result = cursor.fetchone()
+            conn.close()
+            if result:
+                return result[0]
+            else:
+                return None
+        except sqlite3.Error as e:
+            log_error(f"Database error while fetching platform: {e}")
+            return None
+
+    def show_platform_selection_dialog(self):
+        dialog = PlatformSelectionDialog()
+        if dialog.exec_() == QDialog.Accepted:
+            selected_platform = dialog.selected_platform
+            self.save_user_platform(selected_platform)
+            self.setup_ui(selected_platform)
+        else:
+            # If the user closes the dialog without selecting, exit the app
+            QMessageBox.critical(self, "Platform Selection Required",
+                                 "You must select a gaming platform to use this application.")
+            sys.exit()
+
+    def save_user_platform(self, platform):
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO Users (username, platform) 
+                VALUES (?, ?) 
+                ON CONFLICT(username) DO UPDATE SET platform=excluded.platform
+            """, ("default_user", platform))
+            conn.commit()
+            conn.close()
+            log_activity(f"Platform set to {platform}")
+        except sqlite3.Error as e:
+            log_error(f"Failed to save platform: {e}")
+            QMessageBox.critical(self, "Database Error", f"Failed to save platform: {e}")
+            sys.exit()
+
+    def setup_ui(self, platform):
+        # Create tabs
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #444; }
+            QTabBar::tab {
+                background: #1f1f1f;
+                color: white;
+                padding: 10px;
+                border: 1px solid #444;
+                border-bottom: none;
+            }
+            QTabBar::tab:selected {
+                background: #2e2e2e;
+                font-weight: bold;
+            }
+            QTabBar::tab:hover {
+                background: #3e3e3e;
+            }
+        """)
+        self.setCentralWidget(self.tabs)
+
+        # Add individual tabs
+        self.alerts_tab = AlertsTab(self.scheduler, self.tray_icon, platform)
+        self.platform_tab = PlatformTab(self)  # Pass reference to MainWindow
+        self.reminders_tab = RemindersTab(self.scheduler, self.tray_icon)
+        self.query_tab = QueryTab()
+
+        self.tabs.addTab(self.alerts_tab, "Alerts")
+        self.tabs.addTab(self.platform_tab, "Platform Settings")
+        self.tabs.addTab(self.reminders_tab, "Reminders")
+        self.tabs.addTab(self.query_tab, "Data Queries")
+
+    def closeEvent(self, event):
+        # Ensure the scheduler shuts down when the app closes
+        self.scheduler.shutdown()
+        event.accept()
+
+
+# Alerts Tab
+class AlertsTab(QWidget):
+    def __init__(self, scheduler, tray_icon, platform):
+        super().__init__()
+        self.scheduler = scheduler
+        self.tray_icon = tray_icon
+        self.platform = platform  # Store the selected platform
+
+        # Layouts
+        main_layout = QVBoxLayout()
+        header_layout = QHBoxLayout()
+        main_layout.addLayout(header_layout)
+
+        # Header Label
+        header_label = QLabel("Current Warframe Alerts")
+        header_label.setFont(QFont("Arial", 16, QFont.Bold))
+        header_layout.addWidget(header_label)
+
+        # Refresh Button with Icon
+        self.refresh_button = QPushButton()
+        self.refresh_button.setIcon(QIcon('icons/refresh.png'))  # Replace with your refresh icon path
+        self.refresh_button.setToolTip("Refresh Alerts")
+        self.refresh_button.setFixedSize(40, 40)
+        self.refresh_button.clicked.connect(self.refresh_alerts)
+        header_layout.addWidget(self.refresh_button)
+
+        header_layout.addStretch()
+
+        # Alerts Display
+        self.alerts_display = QTextEdit()
+        self.alerts_display.setReadOnly(True)
+        self.alerts_display.setStyleSheet("""
+            QTextEdit {
+                background-color: #2b2b2b;
+                color: white;
+                font-family: Arial;
+                font-size: 12pt;
+            }
+        """)
+        main_layout.addWidget(self.alerts_display)
+
+        self.setLayout(main_layout)
+
+        # Thread for fetching alerts
+        self.fetch_thread = FetchAlertsThread(self.platform)
+        self.fetch_thread.fetched.connect(self.display_alerts)
+        self.fetch_thread.error.connect(self.display_error)
+
+        # Initial fetch
+        self.refresh_alerts()
+
+        # Timer to refresh every 10 minutes
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh_alerts)
+        self.timer.start(600000)  # 600,000 ms = 10 minutes
+
+        # Schedule cleanup job
+        self.scheduler.add_job(self.cleanup_expired_alerts, 'interval', hours=1)
+
+    def refresh_alerts(self):
+        self.fetch_thread = FetchAlertsThread(self.platform)  # Re-initialize thread to allow multiple fetches
+        self.fetch_thread.fetched.connect(self.display_alerts)
+        self.fetch_thread.error.connect(self.display_error)
+        self.fetch_thread.start()
+
+    def display_alerts(self, alerts):
+        if alerts:
+            display_text = ""
+            try:
+                conn = sqlite3.connect('warframe_app.db')
+                cursor = conn.cursor()
+
+                # Clear existing alerts to avoid duplicates
+                cursor.execute("DELETE FROM Alerts")
+                conn.commit()
+
+                # Insert new alerts into the Alerts table
+                for alert in alerts:
+                    mission = alert.get('missionType', 'N/A')
+                    reward = alert.get('reward', 'N/A')
+                    expiry = alert.get('expiry', 'N/A')
+                    status = "active"
+
+                    cursor.execute('''
+                        INSERT INTO Alerts (mission_type, reward, expiry, status)
+                        VALUES (?, ?, ?, ?)
+                    ''', (mission, reward, expiry, status))
+                conn.commit()
+                conn.close()
+                log_activity("Alerts database updated.")
+            except sqlite3.Error as e:
+                log_error(f"Failed to update alerts database: {e}")
+
+            # Prepare display text
+            for alert in alerts:
+                mission = alert.get('missionType', 'N/A')
+                reward = alert.get('reward', 'N/A')
+                expiry = alert.get('expiry', 'N/A')
+                try:
+                    expiry_time = datetime.datetime.fromisoformat(expiry)
+                    time_remaining = expiry_time - datetime.datetime.utcnow()
+                except ValueError:
+                    expiry_time = "Invalid Date"
+                    time_remaining = "N/A"
+                display_text += (
+                    f"<b>Mission:</b> {mission}<br>"
+                    f"<b>Reward:</b> {reward}<br>"
+                    f"<b>Expires in:</b> {self.format_timedelta(time_remaining)}<br>"
+                    f"<hr>"
+                )
+            self.alerts_display.setHtml(display_text)
+        else:
+            self.alerts_display.setText("No current alerts.")
+
+    def display_error(self, error_message):
+        self.alerts_display.setText(f"Failed to fetch alerts: {error_message}")
+        self.tray_icon.showMessage("Warframe App", "Failed to fetch alerts.", QSystemTrayIcon.Critical, 3000)
+
+    def format_timedelta(self, td):
+        if isinstance(td, datetime.timedelta):
+            days = td.days
+            hours, remainder = divmod(td.seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            parts = []
+            if days > 0:
+                parts.append(f"{days}d")
+            if hours > 0:
+                parts.append(f"{hours}h")
+            if minutes > 0:
+                parts.append(f"{minutes}m")
+            if seconds > 0:
+                parts.append(f"{seconds}s")
+            return ' '.join(parts)
+        else:
+            return td
+
+    def cleanup_expired_alerts(self):
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            current_time = datetime.datetime.utcnow().isoformat()
+            cursor.execute('''
+                DELETE FROM Alerts
+                WHERE expiry <= ?
+            ''', (current_time,))
+            conn.commit()
+            conn.close()
+            log_activity("Expired alerts cleaned up.")
+        except sqlite3.Error as e:
+            log_error(f"Failed to clean up expired alerts: {e}")
+
+
+# Platform Settings Tab
+class PlatformTab(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window  # Reference to MainWindow
+        layout = QVBoxLayout()
+
+        # Label
+        self.label = QLabel("Set your gaming platform:")
+        self.label.setFont(QFont("Arial", 14))
+        layout.addWidget(self.label)
+
+        # Platform ComboBox
+        self.platform_combo = QComboBox()
+        self.platform_combo.addItems(["PC", "PS4", "PS5", "Xbox One", "Xbox Series X", "Nintendo Switch"])
+        self.platform_combo.setFont(QFont("Arial", 12))
+        layout.addWidget(self.platform_combo)
+
+        # Set Platform Button
+        self.set_button = QPushButton("Set Platform")
+        self.set_button.setFont(QFont("Arial", 12))
+        self.set_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1f1f1f;
+                color: white;
+                padding: 10px;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #333333;
+            }
+        """)
+        self.set_button.clicked.connect(self.set_platform)
+        layout.addWidget(self.set_button)
+
+        layout.addStretch()
+
+        self.setLayout(layout)
+
+    def set_platform(self):
+        selected_platform = self.platform_combo.currentText()
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO Users (username, platform) 
+                VALUES (?, ?) 
+                ON CONFLICT(username) DO UPDATE SET platform=excluded.platform
+            """, ("default_user", selected_platform))
+            conn.commit()
+            conn.close()
+            log_activity(f"Platform set to {selected_platform}")
+            QMessageBox.information(self, "Platform Set", f"Platform set to {selected_platform}")
+
+            # Notify the main window to refresh alerts
+            alerts_tab = self.main_window.alerts_tab
+            alerts_tab.platform = selected_platform
+            alerts_tab.refresh_alerts()
+
+        except sqlite3.Error as e:
+            log_error(f"Failed to set platform: {e}")
+            QMessageBox.critical(self, "Database Error", f"Failed to set platform: {e}")
+
+
+# Reminders Tab
+class RemindersTab(QWidget):
+    def __init__(self, scheduler, tray_icon):
+        super().__init__()
+        self.scheduler = scheduler
+        self.tray_icon = tray_icon
+
+        # Layouts
+        main_layout = QVBoxLayout()
+        header_layout = QHBoxLayout()
+        main_layout.addLayout(header_layout)
+
+        # Header Label
+        header_label = QLabel("Set a Reminder")
+        header_label.setFont(QFont("Arial", 16, QFont.Bold))
+        header_layout.addWidget(header_label)
+
+        # Add Reminder Button
+        self.add_reminder_button = QPushButton("Add Reminder")
+        self.add_reminder_button.setFont(QFont("Arial", 12))
+        self.add_reminder_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1f1f1f;
+                color: white;
+                padding: 10px;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #333333;
+            }
+        """)
+        self.add_reminder_button.clicked.connect(self.open_add_reminder_dialog)
+        header_layout.addWidget(self.add_reminder_button)
+
+        header_layout.addStretch()
+
+        # Reminders Display
+        self.reminders_display = QTextEdit()
+        self.reminders_display.setReadOnly(True)
+        self.reminders_display.setStyleSheet("""
+            QTextEdit {
+                background-color: #2b2b2b;
+                color: white;
+                font-family: Arial;
+                font-size: 12pt;
+            }
+        """)
+        main_layout.addWidget(self.reminders_display)
+
+        self.setLayout(main_layout)
+
+        # Load existing reminders
+        self.load_reminders()
+
+    def open_add_reminder_dialog(self):
+        dialog = AddReminderDialog(self.scheduler, self.tray_icon)
+        if dialog.exec_() == QDialog.Accepted:
+            self.load_reminders()
+
+    def load_reminders(self):
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT reminder_type, details, scheduled_time, status
+                FROM Reminders
+                WHERE status = 'scheduled'
+                ORDER BY scheduled_time ASC
+            ''')
+            reminders = cursor.fetchall()
+            conn.close()
+
+            display_text = ""
+            for reminder in reminders:
+                r_type, details, scheduled_time, status = reminder
+                try:
+                    scheduled_dt = datetime.datetime.fromisoformat(scheduled_time)
+                except ValueError:
+                    scheduled_dt = "Invalid Date"
+                display_text += (
+                    f"<b>Type:</b> {r_type}<br>"
+                    f"<b>Details:</b> {details}<br>"
+                    f"<b>Scheduled Time:</b> {scheduled_dt}<br>"
+                    f"<hr>"
+                )
+            self.reminders_display.setHtml(display_text)
+        except sqlite3.Error as e:
+            self.reminders_display.setText(f"Failed to load reminders: {e}")
+
+
+# Add Reminder Dialog
+class AddReminderDialog(QDialog):
+    def __init__(self, scheduler, tray_icon):
+        super().__init__()
+        self.scheduler = scheduler
+        self.tray_icon = tray_icon
+        self.setWindowTitle("Add Reminder")
+        self.setFixedSize(400, 300)
+
+        layout = QVBoxLayout()
+
+        # Reminder Type
+        self.type_label = QLabel("Reminder Type:")
+        self.type_label.setFont(QFont("Arial", 12))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Alerts", "Activities", "Foundry Builds"])
+        self.type_combo.setFont(QFont("Arial", 12))
+        layout.addWidget(self.type_label)
+        layout.addWidget(self.type_combo)
+
+        # Details
+        self.details_label = QLabel("Details:")
+        self.details_label.setFont(QFont("Arial", 12))
+        self.details_input = QLineEdit()
+        self.details_input.setFont(QFont("Arial", 12))
+        layout.addWidget(self.details_label)
+        layout.addWidget(self.details_input)
+
+        # Scheduled Time
+        self.time_label = QLabel("Scheduled Time:")
+        self.time_label.setFont(QFont("Arial", 12))
+        self.time_picker = QDateTimeEdit()
+        self.time_picker.setCalendarPopup(True)
+        self.time_picker.setDateTime(datetime.datetime.now() + datetime.timedelta(minutes=1))
+        self.time_picker.setFont(QFont("Arial", 12))
+        layout.addWidget(self.time_label)
+        layout.addWidget(self.time_picker)
+
+        # Set Reminder Button
+        self.set_button = QPushButton("Set Reminder")
+        self.set_button.setFont(QFont("Arial", 12))
+        self.set_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1f1f1f;
+                color: white;
+                padding: 10px;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #333333;
+            }
+        """)
+        self.set_button.clicked.connect(self.set_reminder)
+        layout.addWidget(self.set_button)
+
+        self.setLayout(layout)
+
+    def set_reminder(self):
+        reminder_type = self.type_combo.currentText()
+        details = self.details_input.text().strip()
+        scheduled_time = self.time_picker.dateTime().toPyDateTime()
+
+        if not details:
+            QMessageBox.warning(self, "Input Error", "Please enter reminder details.")
+            return
+
+        if scheduled_time <= datetime.datetime.now():
+            QMessageBox.warning(self, "Input Error", "Scheduled time must be in the future.")
+            return
+
+        # Save to database
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO Reminders (user_id, reminder_type, details, scheduled_time, status)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (1, reminder_type, details, scheduled_time.isoformat(), 'scheduled'))
+            reminder_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+
+            # Schedule the reminder
+            self.scheduler.add_job(
+                self.trigger_reminder,
+                'date',
+                run_date=scheduled_time,
+                args=[reminder_id, details]
+            )
+
+            log_activity(f"Set reminder: '{details}' at {scheduled_time}")
+            QMessageBox.information(self, "Reminder Set", f"Reminder set for {scheduled_time}")
+            self.accept()
+        except sqlite3.Error as e:
+            log_error(f"Failed to set reminder: {e}")
+            QMessageBox.critical(self, "Database Error", f"Failed to set reminder: {e}")
+
+    def trigger_reminder(self, reminder_id, details):
+        # Show a popup reminder
+        self.tray_icon.showMessage("Warframe Reminder", f"Reminder: {details}", QSystemTrayIcon.Information, 3000)
+        QMessageBox.information(self, "Reminder", f"Reminder: {details}")
+
+        # Update reminder status in the database
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE Reminders
+                SET status = ?
+                WHERE id = ?
+            ''', ('completed', reminder_id))
+            conn.commit()
+            conn.close()
+
+            log_activity(f"Reminder triggered: '{details}'")
+        except sqlite3.Error as e:
+            log_error(f"Failed to update reminder status: {e}")
+
+
+# Query Tab
+class QueryTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout()
+
+        # Query Input
+        self.query_input = QLineEdit()
+        self.query_input.setPlaceholderText("Enter your SQL SELECT query here...")
+        self.query_input.setFont(QFont("Arial", 12))
+        layout.addWidget(QLabel("Data Queries:"))
+        layout.addWidget(self.query_input)
+
+        # Execute Button
+        self.execute_query_button = QPushButton("Execute Query")
+        self.execute_query_button.setFont(QFont("Arial", 12))
+        self.execute_query_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1f1f1f;
+                color: white;
+                padding: 10px;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #333333;
+            }
+        """)
+        self.execute_query_button.clicked.connect(self.execute_query)
+        layout.addWidget(self.execute_query_button)
+
+        # Query Results
+        self.query_result = QTextEdit()
+        self.query_result.setReadOnly(True)
+        self.query_result.setStyleSheet("""
+            QTextEdit {
+                background-color: #2b2b2b;
+                color: white;
+                font-family: Arial;
+                font-size: 12pt;
+            }
+        """)
+        layout.addWidget(QLabel("Query Results:"))
+        layout.addWidget(self.query_result)
+
+        self.setLayout(layout)
+
+    def execute_query(self):
+        query = self.query_input.text().strip()
+        if not query:
+            QMessageBox.warning(self, "Input Error", "Please enter a query.")
+            return
+
+        # Restrict to SELECT statements for safety
+        if not query.lower().startswith("select"):
+            QMessageBox.warning(self, "Input Error", "Only SELECT queries are allowed.")
+            return
+
+        try:
+            conn = sqlite3.connect('warframe_app.db')
+            cursor = conn.cursor()
+            cursor.execute(query)
+            results = cursor.fetchall()
+            columns = [description[0] for description in cursor.description]
+            conn.close()
+
+            if results:
+                display_text = "<b>" + "</b>\t<b>".join(columns) + "</b><br>" + "-" * 80 + "<br>"
+                for row in results:
+                    display_text += "\t".join([str(item) for item in row]) + "<br>"
+                self.query_result.setHtml(display_text)
+            else:
+                self.query_result.setText("No results found.")
+        except sqlite3.Error as e:
+            self.query_result.setText(f"Query failed: {e}")
+
+
+# Run the Application
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
